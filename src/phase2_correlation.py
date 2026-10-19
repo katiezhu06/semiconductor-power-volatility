@@ -1,9 +1,13 @@
 """Phase 2: rolling correlation of SOXX and power-producer volatility.
 
-Loads the 20-day rolling volatility series from Phase 1, keeps dates where
-both series are observed, and computes rolling Pearson correlations. The
-primary window is 60 trading days. Windows of 40 and 90 trading days are
+Loads the 20-day rolling volatility series from a Phase 1 run, keeps dates
+where both series are observed, and computes rolling Pearson correlations.
+The primary window is 60 trading days. Windows of 40 and 90 trading days are
 sensitivity checks.
+
+`python src/run_pipeline.py` calls Phase 1 and then this module, writing both
+stages into the same data/phase1/run_N folder. Running this file on its own
+reads the latest of those folders, and runs Phase 1 first if none exists yet.
 
 On each date, the correlation uses the two volatility readings from that date
 and the previous dates in the window. A value near 1 means the two volatilities
@@ -28,19 +32,19 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 
+import phase1_preprocess
+
 VOLATILITY_COLUMNS = ["SOXX", "power_portfolio"]
 WINDOWS = (40, 60, 90)
 PRIMARY_WINDOW = 60
-DEFAULT_VOLATILITY = Path("data/rolling_volatility.csv")
-DEFAULT_OUTPUT = Path("data/processed/rolling_correlation.csv")
-DEFAULT_FIGURE = Path("figures/rolling_correlation.png")
+DEFAULT_DATA_ROOT = Path("data")
 
 
 def load_volatility(path: Path) -> pd.DataFrame:
     """Read the Phase 1 volatility file and keep the two series used here."""
     if not path.exists():
         raise RuntimeError(
-            f"Could not find {path}. Run src/phase1_preprocess.py first."
+            f"Could not find {path}. Run src/run_pipeline.py first."
         )
     volatility = pd.read_csv(path, index_col="Date", parse_dates=True)
     missing = [column for column in VOLATILITY_COLUMNS if column not in volatility.columns]
@@ -234,25 +238,58 @@ def run(
     return summary
 
 
+def run_after_phase1(
+    start: str,
+    window: int,
+    data_root: Path,
+    windows: list[int],
+    primary_window: int,
+) -> str:
+    """Run Phase 1 into a new folder, then correlate the volatility file it writes."""
+    run_dir, diagnostics = phase1_preprocess.run(start, window, data_root)
+    summary = run(
+        run_dir / "rolling_volatility.csv",
+        run_dir / "rolling_correlation.csv",
+        run_dir / "rolling_correlation.png",
+        windows,
+        primary_window,
+    )
+    return diagnostics + "\n" + summary
+
+
+def resolve_volatility_path(volatility: Path | None, data_root: Path) -> Path:
+    """Use the given file, or the rolling-volatility file from the latest run."""
+    if volatility is not None:
+        return volatility
+    run_dir = phase1_preprocess.latest_run_directory(data_root)
+    return run_dir / "rolling_volatility.csv"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--volatility",
         type=Path,
-        default=DEFAULT_VOLATILITY,
-        help="Phase 1 rolling-volatility CSV",
+        default=None,
+        help="Phase 1 rolling-volatility CSV. Defaults to the latest data/phase1/run_N file",
+    )
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=DEFAULT_DATA_ROOT,
+        help="Where to look for Phase 1 runs when --volatility is omitted",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=DEFAULT_OUTPUT,
-        help="CSV path for the rolling correlations",
+        default=None,
+        help="CSV path for the rolling correlations. Defaults to the Phase 1 run folder",
     )
     parser.add_argument(
         "--figure",
         type=Path,
-        default=DEFAULT_FIGURE,
-        help="PNG path for the correlation plot",
+        default=None,
+        help="PNG path for the correlation plot. Defaults to the Phase 1 run folder",
     )
     parser.add_argument(
         "--windows",
@@ -267,17 +304,32 @@ def parse_args() -> argparse.Namespace:
         default=PRIMARY_WINDOW,
         help="Window to treat as the primary estimate in the summary and plot",
     )
+    parser.add_argument("--start", default=phase1_preprocess.DEFAULT_START, help="Used only if Phase 1 has not been run yet")
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=phase1_preprocess.DEFAULT_WINDOW,
+        help="Volatility window used only if Phase 1 has not been run yet",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     windows = list(dict.fromkeys(args.windows))
+    if args.window < 2:
+        raise SystemExit("--window must be at least 2")
     if not windows or any(window < 2 for window in windows):
         raise SystemExit("Each window must be at least 2 observations")
     if args.primary not in windows:
         raise SystemExit("--primary must be one of the windows")
-    print(run(args.volatility, args.output, args.figure, windows, args.primary))
+    if args.volatility is None and not phase1_preprocess.run_directories(args.data_root):
+        print(run_after_phase1(args.start, args.window, args.data_root, windows, args.primary))
+        return
+    volatility_path = resolve_volatility_path(args.volatility, args.data_root)
+    output_path = args.output or volatility_path.with_name("rolling_correlation.csv")
+    figure_path = args.figure or volatility_path.with_name("rolling_correlation.png")
+    print(run(volatility_path, output_path, figure_path, windows, args.primary))
 
 
 if __name__ == "__main__":
