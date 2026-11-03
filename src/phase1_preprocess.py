@@ -5,8 +5,12 @@ shared by all four, computes daily log returns, forms an equal-weight
 power-producer portfolio from CEG, VST, and NRG, and computes 20-day rolling
 volatility for SOXX and that portfolio.
 
+Each run writes a new folder: data/phase1/run_1, then data/phase1/run_2, and
+so on. Older runs stay on disk.
+
 This script does not estimate a VAR, compute forecast-error variance
-decompositions, measure correlation, or build network graphs.
+decompositions, measure correlation, or build network graphs. The pipeline in
+src/run_pipeline.py calls this module and then Phase 2.
 """
 
 from __future__ import annotations
@@ -135,6 +139,39 @@ def rolling_volatility(returns: pd.DataFrame, window: int) -> pd.DataFrame:
     return volatility
 
 
+def run_directories(data_root: Path) -> list[Path]:
+    """Return data/phase1/run_N folders, oldest first."""
+    phase_dir = data_root / "phase1"
+    if not phase_dir.is_dir():
+        return []
+    numbered: list[tuple[int, Path]] = []
+    for path in phase_dir.iterdir():
+        if not path.is_dir() or not path.name.startswith("run_"):
+            continue
+        suffix = path.name.removeprefix("run_")
+        if suffix.isdigit():
+            numbered.append((int(suffix), path))
+    numbered.sort()
+    return [path for _, path in numbered]
+
+
+def next_run_directory(data_root: Path) -> Path:
+    """Create the next data/phase1/run_N folder. Existing runs are not replaced."""
+    existing = run_directories(data_root)
+    next_number = 1 if not existing else int(existing[-1].name.removeprefix("run_")) + 1
+    run_dir = data_root / "phase1" / f"run_{next_number}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def latest_run_directory(data_root: Path) -> Path:
+    """Return the highest data/phase1/run_N folder."""
+    existing = run_directories(data_root)
+    if not existing:
+        raise RuntimeError(f"No Phase 1 runs found under {data_root / 'phase1'}")
+    return existing[-1]
+
+
 def format_diagnostics(
     raw: dict[str, pd.Series],
     prices: pd.DataFrame,
@@ -144,6 +181,7 @@ def format_diagnostics(
     start: str,
     window: int,
     dropped_session: pd.Timestamp | None,
+    output_dir: Path,
 ) -> str:
     missing_counts = prices.isna().sum()
     incomplete_dates = prices.index.difference(complete.index)
@@ -154,6 +192,7 @@ def format_diagnostics(
         f"Generated (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}",
         f"yfinance: {yf.__version__}",
         f"Requested start: {start}",
+        f"Output directory: {output_dir}",
         "Adjustment: Yahoo Finance adjusted close (auto_adjust=True)",
         (
             f"Dropped in-progress session: {dropped_session.date()}"
@@ -240,7 +279,12 @@ def save_outputs(
     (output_dir / "phase1_diagnostics.txt").write_text(diagnostics, encoding="utf-8")
 
 
-def run(start: str, window: int, output_dir: Path) -> str:
+def run(start: str, window: int, data_root: Path) -> tuple[Path, str]:
+    """Build the price, return, and volatility files in a new run folder.
+
+    The folder is data_root/phase1/run_N. N is one higher than any run already
+    stored there, so this function does not overwrite an earlier run.
+    """
     prices, raw, dropped_session = build_panel(start)
     complete = shared_prices(prices)
     returns = add_power_portfolio(log_returns(complete))
@@ -258,11 +302,12 @@ def run(start: str, window: int, output_dir: Path) -> str:
     if volatility.iloc[window - 1 :].isna().any().any():
         raise RuntimeError("Rolling volatility is missing after the warmup window")
 
+    output_dir = next_run_directory(data_root)
     diagnostics = format_diagnostics(
-        raw, prices, complete, returns, volatility, start, window, dropped_session
+        raw, prices, complete, returns, volatility, start, window, dropped_session, output_dir
     )
     save_outputs(output_dir, complete, returns, volatility, diagnostics)
-    return diagnostics
+    return output_dir, diagnostics
 
 
 def parse_args() -> argparse.Namespace:
@@ -270,10 +315,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start", default=DEFAULT_START, help="First download date (YYYY-MM-DD)")
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW, help="Rolling window in trading days")
     parser.add_argument(
-        "--output-dir",
+        "--data-root",
         type=Path,
         default=Path("data"),
-        help="Directory for CSV outputs and the diagnostics report",
+        help="Root directory. Each run is saved in phase1/run_N under this directory",
     )
     return parser.parse_args()
 
@@ -282,7 +327,8 @@ def main() -> None:
     args = parse_args()
     if args.window < 2:
         raise SystemExit("--window must be at least 2")
-    print(run(args.start, args.window, args.output_dir))
+    _, diagnostics = run(args.start, args.window, args.data_root)
+    print(diagnostics)
 
 
 if __name__ == "__main__":
